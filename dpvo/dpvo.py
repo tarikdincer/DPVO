@@ -9,6 +9,7 @@ from .lietorch import SE3
 from .net import VONet
 from .patchgraph import PatchGraph
 from .utils import *
+from .ba import BA as python_BA
 
 mp.set_start_method('spawn', True)
 
@@ -19,11 +20,12 @@ Id = SE3.Identity(1, device="cuda")
 
 class DPVO:
 
-    def __init__(self, cfg, network, ht=480, wd=640, viz=False):
+    def __init__(self, cfg, network, ht=480, wd=640, viz=False, use_metric_depth=True):
         self.cfg = cfg
         self.load_weights(network)
         self.is_initialized = False
         self.enable_timing = False
+        self.use_metric_depth = use_metric_depth
         torch.set_num_threads(2)
 
         self.M = self.cfg.PATCHES_PER_FRAME
@@ -290,6 +292,9 @@ class DPVO:
                 self.pg.poses_[i] = self.pg.poses_[i+1]
                 self.pg.patches_[i] = self.pg.patches_[i+1]
                 self.pg.intrinsics_[i] = self.pg.intrinsics_[i+1]
+                self.pg.prior_disps_[i] = self.pg.prior_disps_[i+1]
+                self.pg.depth_gate_[i] = self.pg.depth_gate_[i+1]
+
 
                 self.imap_[i % self.pmem] = self.imap_[(i+1) % self.pmem]
                 self.gmap_[i % self.pmem] = self.gmap_[(i+1) % self.pmem]
@@ -342,22 +347,74 @@ class DPVO:
         self.pg.target = target
         self.pg.weight = weight
 
-        with Timer("BA", enabled=self.enable_timing):
-            try:
-                # run global bundle adjustment if there exist long-range edges
-                if (self.pg.ii < self.n - self.cfg.REMOVAL_WINDOW - 1).any() and not self.ran_global_ba[self.n]:
-                    self.__run_global_BA()
-                else:
+        if self.use_metric_depth:
+            with Timer("BA", enabled=self.enable_timing):
+                try:
+                    # window start frame index (same as original dpvo logic)
                     t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
                     t0 = max(t0, 1)
-                    fastba.BA(self.poses, self.patches, self.intrinsics, 
-                        target, weight, lmbda, self.pg.ii, self.pg.jj, self.pg.kk, t0, self.n, M=self.M, iterations=2, eff_impl=False)
-            except:
-                print("Warning BA failed...")
 
-            points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
-            points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
-            self.pg.points_[:len(points)] = points[:]
+                    # bounds for in-bounds check (match pops.transform coordinate system)
+                    bounds = torch.as_tensor(
+                        [0.0, 0.0, self.wd / self.RES, self.ht / self.RES],
+                        device="cuda"
+                    )
+
+                    # select active factors inside the window, like fastba does via t0
+                    # (python BA doesn't have t0, so we filter edges ourselves)
+                    keep = (self.pg.ii >= t0) & (self.pg.jj >= t0)
+
+                    ii = self.pg.ii[keep]
+                    jj = self.pg.jj[keep]
+                    kk = self.pg.kk[keep]
+
+                    target = self.pg.target[:, keep]
+                    weight = self.pg.weight[:, keep]
+
+                    # prior disp + gate (flattened per patch)
+                    prior_disps = self.pg.prior_disps  # shape (1, N*M, 1)
+                    depth_gate = self.pg.depth_gate    # shape (1, N*M, 1)
+
+
+                    for _ in range(2):
+                        poses_new, patches_new = python_BA(
+                            SE3(self.poses),                    # poses object
+                            self.patches,                       # (1, N*M, 3, P, P)
+                            self.intrinsics,                    # (1, N, 4)
+                            target, weight,
+                            torch.as_tensor([1e-4], device="cuda"),
+                            ii, jj, kk,
+                            bounds=bounds,
+                            fixedp=1,
+                            prior_disps=prior_disps,
+                            depth_gate=depth_gate,
+                            prior_weight=0 if not self.use_metric_depth else (self.cfg.DEPTH_PRIOR_W if hasattr(self.cfg, "DEPTH_PRIOR_W") else 0.2)
+                        )
+                        self.pg.poses_.copy_(poses_new.data.reshape_as(self.pg.poses_))
+                        self.pg.patches_.copy_(patches_new.reshape_as(self.pg.patches_))
+                except Exception as e:
+                    print("Warning python BA failed:", e)
+
+                points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
+                points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
+                self.pg.points_[:len(points)] = points[:]
+        else:
+            with Timer("BA", enabled=self.enable_timing):
+                try:
+                    # run global bundle adjustment if there exist long-range edges
+                    if (self.pg.ii < self.n - self.cfg.REMOVAL_WINDOW - 1).any() and not self.ran_global_ba[self.n]:
+                        self.__run_global_BA()
+                    else:
+                        t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
+                        t0 = max(t0, 1)
+                        fastba.BA(self.poses, self.patches, self.intrinsics, 
+                            target, weight, lmbda, self.pg.ii, self.pg.jj, self.pg.kk, t0, self.n, M=self.M, iterations=2, eff_impl=False)
+                except:
+                    print("Warning BA failed...")
+
+                points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
+                points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
+                self.pg.points_[:len(points)] = points[:]
 
     def __edges_forw(self):
         r=self.cfg.PATCH_LIFETIME
@@ -374,7 +431,7 @@ class DPVO:
         return flatmeshgrid(torch.arange(t0, t1, device="cuda"),
             torch.arange(max(self.n-r, 0), self.n, device="cuda"), indexing='ij')
 
-    def __call__(self, tstamp, image, intrinsics):
+    def __call__(self, tstamp, image, intrinsics, metric_depth = None):
         """ track new frame """
 
         if self.cfg.CLASSIC_LOOP_CLOSURE:
@@ -423,11 +480,33 @@ class DPVO:
                 tvec_qvec = self.poses[self.n-1]
                 self.pg.poses_[self.n] = tvec_qvec
 
-        # TODO better depth initialization
-        patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
-        if self.is_initialized:
-            s = torch.median(self.pg.patches_[self.n-3:self.n,:,2])
-            patches[:,:,2] = s
+        if metric_depth is not None:
+            depth = metric_depth.to(device=patches.device, dtype=torch.float32).clamp(min=1e-3)
+            H, W = depth.shape
+
+            cx = patches[0, :, 0, self.P//2, self.P//2]
+            cy = patches[0, :, 1, self.P//2, self.P//2]
+
+
+            cx_full = self.RES * cx
+            cy_full = self.RES * cy
+
+
+            cx_idx = cx_full.round().long().clamp(0, W - 1)
+            cy_idx = cy_full.round().long().clamp(0, H - 1)
+
+            z = depth[cy_idx, cx_idx]
+
+            disp = (1.0 / z).clamp(min=1e-3, max=10.0)
+            
+
+            self.pg.prior_disps_[self.n, :, 0] = disp
+            patches[:, :, 2] = disp.view(1, -1, 1, 1)
+        else:
+            patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
+            if self.is_initialized:
+                s = torch.median(self.pg.patches_[self.n-3:self.n,:,2])
+                patches[:,:,2] = s
 
         self.pg.patches_[self.n] = patches
 

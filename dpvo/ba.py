@@ -83,7 +83,8 @@ def block_show(A):
     plt.imshow(A[0].detach().cpu().numpy())
     plt.show()
 
-def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, ep=100.0, PRINT=False, fixedp=1, structure_only=False):
+def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, ep=100.0, PRINT=False, fixedp=1, structure_only=False,
+       prior_disps=None, depth_gate=None, prior_weight=0.05):
     """ bundle adjustment """
 
     b = 1
@@ -152,8 +153,50 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, 
 
     w = safe_scatter_add_vec(torch.matmul(wJzT,  r), kk, m)
 
+   
+    if prior_disps is not None:
+        # get current disps at the center pixel for each structure variable
+        p_center = patches.shape[3] // 2
+        cur_disp = patches[:, kx, 2, p_center, p_center].view(1, -1, 1, 1)
+
+        # gather priors for those same structure vars
+        if prior_disps.ndim == 2:
+            prior_k = prior_disps[:, kx].view(1, -1, 1, 1)
+        elif prior_disps.ndim == 3:
+            prior_k = prior_disps[:, kx, 0].view(1, -1, 1, 1)
+        elif prior_disps.ndim == 4:
+            prior_k = prior_disps[:, kx, :, :].view(1, -1, 1, 1)
+        else:
+            raise ValueError(...)
+
+        # gather gates
+        if depth_gate is None:
+            gate_k = torch.ones((1, m, 1, 1), device=patches.device, dtype=patches.dtype)
+        else:
+            if depth_gate.ndim == 2:
+                gate_k = depth_gate[:, kx].view(1, -1, 1, 1)
+            elif depth_gate.ndim == 3:
+                gate_k = depth_gate[:, kx, 0].view(1, -1, 1, 1)
+            elif depth_gate.ndim == 4:
+                gate_k = depth_gate[:, kx, :, :].view(1, -1, 1, 1)
+            else:
+                raise ValueError(...)
+
+        # Scale prior relative to reprojection term magnitude
+        C_mean = C.mean().clamp(min=1.0)
+        adaptive_weight = prior_weight * C_mean 
+
+        # Apply prior
+        C = C + gate_k * adaptive_weight
+        w = w + gate_k * adaptive_weight * (prior_k - cur_disp)
+
+
     if isinstance(lmbda, torch.Tensor):
-        lmbda = lmbda.reshape(*C.shape)
+        if lmbda.numel() == 1:
+            lmbda = lmbda.view(1, 1, 1, 1)
+        else:
+            lmbda = lmbda.reshape_as(C)
+
         
     Q = 1.0 / (C + lmbda)
     

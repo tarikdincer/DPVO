@@ -35,4 +35,7 @@ _C.CLASSIC_LOOP_CLOSURE = False
 _C.LOOP_CLOSE_WINDOW_SIZE = 3
 _C.LOOP_RETR_THRESH = 0.04
 
+# Prior weight optimization
+_C.DEPTH_PRIOR_W = 0.05
+
 cfg = _C

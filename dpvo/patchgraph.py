@@ -28,6 +28,10 @@ class PatchGraph:
         self.patches_ = torch.zeros(self.N, self.M, 3, self.P, self.P, dtype=torch.float, device="cuda")
         self.intrinsics_ = torch.zeros(self.N, 4, dtype=torch.float, device="cuda")
 
+        self.prior_disps_ = torch.zeros(self.N, self.M, 1, dtype=torch.float, device="cuda")
+
+        self.depth_gate_ = torch.ones(self.N, self.M, 1, device="cuda")
+
         self.points_ = torch.zeros(self.N * self.M, 3, dtype=torch.float, device="cuda")
         self.colors_ = torch.zeros(self.N, self.M, 3, dtype=torch.uint8, device="cuda")
 
@@ -101,6 +105,15 @@ class PatchGraph:
     @property
     def patches(self):
         return self.patches_.view(1, self.N*self.M, 3, 3, 3)
+    
+    @property
+    def depth_gate(self):
+        return self.depth_gate_.view(1, self.N*self.M, 1)
+
+    
+    @property
+    def prior_disps(self):
+        return self.prior_disps_.view(1, self.N*self.M, 1)
 
     @property
     def intrinsics(self):
