@@ -37,5 +37,6 @@ _C.LOOP_RETR_THRESH = 0.04
 
 # Prior weight optimization
 _C.DEPTH_PRIOR_W = 0.05
+_C.GATE_WARMUP = 12
 
 cfg = _C

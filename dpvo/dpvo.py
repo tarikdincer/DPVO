@@ -502,6 +502,11 @@ class DPVO:
 
             self.pg.prior_disps_[self.n, :, 0] = disp
             patches[:, :, 2] = disp.view(1, -1, 1, 1)
+            warmup = self.cfg.GATE_WARMUP
+            if self.n < warmup:
+                self.pg.depth_gate_[self.n, :, 0] = 0.0
+            else:
+                self.pg.depth_gate_[self.n, :, 0] = 1.0
         else:
             patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
             if self.is_initialized:
