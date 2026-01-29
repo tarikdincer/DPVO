@@ -388,7 +388,7 @@ class DPVO:
                             fixedp=1,
                             prior_disps=prior_disps,
                             depth_gate=depth_gate,
-                            prior_weight=0 if not self.use_metric_depth else (self.cfg.DEPTH_PRIOR_W if hasattr(self.cfg, "DEPTH_PRIOR_W") else 0.2)
+                            prior_weight=0 if not self.use_metric_depth else (self.cfg.DEPTH_PRIOR_W if hasattr(self.cfg, "DEPTH_PRIOR_W") else 5)
                         )
                         self.pg.poses_.copy_(poses_new.data.reshape_as(self.pg.poses_))
                         self.pg.patches_.copy_(patches_new.reshape_as(self.pg.patches_))

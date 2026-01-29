@@ -182,13 +182,9 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, 
             else:
                 raise ValueError(...)
 
-        # Scale prior relative to reprojection term magnitude
-        C_mean = C.mean().clamp(min=1.0)
-        adaptive_weight = prior_weight * C_mean 
-
         # Apply prior
-        C = C + gate_k * adaptive_weight
-        w = w + gate_k * adaptive_weight * (prior_k - cur_disp)
+        C = C + gate_k * prior_weight
+        w = w + gate_k * prior_weight * (prior_k - cur_disp)
 
 
     if isinstance(lmbda, torch.Tensor):
