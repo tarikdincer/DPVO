@@ -376,7 +376,7 @@ class DPVO:
                     depth_gate = self.pg.depth_gate    # shape (1, N*M, 1)
 
 
-                    for _ in range(2):
+                    for _ in range(1):
                         poses_new, patches_new = python_BA(
                             SE3(self.poses),                    # poses object
                             self.patches,                       # (1, N*M, 3, P, P)
@@ -508,10 +508,24 @@ class DPVO:
             else:
                 self.pg.depth_gate_[self.n, :, 0] = 1.0
         else:
-            patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
-            if self.is_initialized:
-                s = torch.median(self.pg.patches_[self.n-3:self.n,:,2])
-                patches[:,:,2] = s
+            if self.n > 0:
+                # propagate last frame's depths (inverse depth / disparity)
+                disp_prev = self.pg.patches_[self.n-1, :, 2, 1, 1]   # shape (M,)
+                disp_prev = disp_prev.clamp(min=1e-3, max=10.0)
+
+                # initialize new patches with previous depths
+                patches[:, :, 2] = disp_prev.view(1, -1, 1, 1)
+
+                # also propagate as prior (optional but good)
+                self.pg.prior_disps_[self.n, :, 0] = disp_prev
+                self.pg.depth_gate_[self.n, :, 0] = 1.0 if self.n >= self.cfg.GATE_WARMUP else 0.0
+            else:
+                # very first frame: use a constant reasonable inverse depth (e.g. 1/3m)
+                disp0 = torch.full((self.M,), 1.0/3.0, device=patches.device)
+                patches[:, :, 2] = disp0.view(1, -1, 1, 1)
+                self.pg.prior_disps_[self.n, :, 0] = disp0
+                self.pg.depth_gate_[self.n, :, 0] = 0.0
+
 
         self.pg.patches_[self.n] = patches
 
