@@ -10,6 +10,9 @@ from .net import VONet
 from .patchgraph import PatchGraph
 from .utils import *
 from .ba import BA as python_BA
+from .timer import timed_block as TimerBlock
+from .trt_encoder import TRTEncoder
+from .trt_update import TRTUpdate
 
 mp.set_start_method('spawn', True)
 
@@ -23,6 +26,21 @@ class DPVO:
     def __init__(self, cfg, network, ht=480, wd=640, viz=False, use_metric_depth=True):
         self.cfg = cfg
         self.load_weights(network)
+
+        # Load checkpoint state dict for SoftAgg weights
+        if isinstance(network, str):
+            _sd = torch.load(network, map_location="cpu")
+            _sd = {k.replace('module.', ''): v for k, v in _sd.items() if "update.lmbda" not in k}
+        else:
+            _sd = network.state_dict()
+
+        self.trt_update = TRTUpdate(
+            phase_a_engine="update_phase_a.trt",
+            phase_c_engine="update_phase_c.trt",
+            state_dict=_sd,
+            update_prefix="update.",
+        )
+
         self.is_initialized = False
         self.enable_timing = False
         self.use_metric_depth = use_metric_depth
@@ -81,6 +99,9 @@ class DPVO:
         if viz:
             self.start_viewer()
 
+        self.fnet_trt = TRTEncoder("fnet_encoder.trt")
+        self.inet_trt = TRTEncoder("inet_encoder.trt")
+
     def load_long_term_loop_closure(self):
         try:
             from .loop_closure.long_term import LongTermLoopClosure
@@ -124,6 +145,75 @@ class DPVO:
             self.pg.points_,
             self.pg.colors_,
             intrinsics_)
+    
+    def patchify_trt(self, images, patches_per_image=80, disps=None,
+                 centroid_sel_strat='RANDOM', return_color=False):
+        """
+        Drop-in replacement for self.network.patchify() using TRT encoders.
+        
+        The ONLY difference from Patchifier.forward() is that lines:
+            fmap = self.fnet(images) / 4.0
+            imap = self.inet(images) / 4.0
+        are replaced with TRT inference. Everything else is identical.
+        """
+
+        P = self.P
+        DIM = self.DIM
+
+        # ── TRT encoder replaces PyTorch encoder ──
+        # Original:
+        #   fmap = self.network.patchify.fnet(images) / 4.0
+        #   imap = self.network.patchify.inet(images) / 4.0
+        # 
+        # TRT version — fnet_trt/inet_trt expect (b, n, 3, H, W), same as original:
+        fmap = self.fnet_trt(images) / 4.0
+        imap = self.inet_trt(images) / 4.0
+
+        # ── Everything below is IDENTICAL to Patchifier.forward() ──
+        b, n, c, h, w = fmap.shape
+
+        if centroid_sel_strat == 'GRADIENT_BIAS':
+            # image gradient for biased patch selection
+            gray = ((images + 0.5) * (255.0 / 2)).sum(dim=2)
+            dx = gray[..., :-1, 1:] - gray[..., :-1, :-1]
+            dy = gray[..., 1:, :-1] - gray[..., :-1, :-1]
+            g = torch.sqrt(dx**2 + dy**2)
+            g = F.avg_pool2d(g, 4, 4)
+
+            x = torch.randint(1, w-1, size=[n, 3*patches_per_image], device="cuda")
+            y = torch.randint(1, h-1, size=[n, 3*patches_per_image], device="cuda")
+            coords = torch.stack([x, y], dim=-1).float()
+            g = altcorr.patchify(g[0,:,None], coords, 0).view(n, 3 * patches_per_image)
+            ix = torch.argsort(g, dim=1)
+            x = torch.gather(x, 1, ix[:, -patches_per_image:])
+            y = torch.gather(y, 1, ix[:, -patches_per_image:])
+
+        elif centroid_sel_strat == 'RANDOM':
+            x = torch.randint(1, w-1, size=[n, patches_per_image], device="cuda")
+            y = torch.randint(1, h-1, size=[n, patches_per_image], device="cuda")
+        else:
+            raise NotImplementedError(f"Patch centroid selection not implemented: {centroid_sel_strat}")
+
+        coords = torch.stack([x, y], dim=-1).float()
+        imap = altcorr.patchify(imap[0], coords, 0).view(b, -1, DIM, 1, 1)
+        gmap = altcorr.patchify(fmap[0], coords, P//2).view(b, -1, 128, P, P)
+
+        if return_color:
+            clr = altcorr.patchify(images[0], 4*(coords + 0.5), 0).view(b, -1, 3)
+
+        if disps is None:
+            disps = torch.ones(b, n, h, w, device="cuda")
+
+        grid, _ = coords_grid_with_index(disps, device=fmap.device)
+        patches = altcorr.patchify(grid[0], coords, P//2).view(b, -1, 3, P, P)
+
+        index = torch.arange(n, device="cuda").view(n, 1)
+        index = index.repeat(1, patches_per_image).reshape(-1)
+
+        if return_color:
+            return fmap, gmap, imap, patches, index, clr
+
+        return fmap, gmap, imap, patches, index
 
     @property
     def poses(self):
@@ -252,7 +342,7 @@ class DPVO:
             corr = self.corr(coords, indicies=(kk, jj))
             ctx = self.imap[:,kk % (self.M * self.pmem)]
             net, (delta, weight, _) = \
-                self.network.update(net, ctx, corr, None, ii, jj, kk)
+                self.trt_update(net, ctx, corr, None, ii, jj, kk)
 
         return torch.quantile(delta.norm(dim=-1).float(), 0.5)
 
@@ -335,10 +425,12 @@ class DPVO:
             coords = self.reproject()
 
             with autocast(enabled=True):
-                corr = self.corr(coords)
+                with TimerBlock("corr"):
+                    corr = self.corr(coords)
                 ctx = self.imap[:, self.pg.kk % (self.M * self.pmem)]
-                self.pg.net, (delta, weight, _) = \
-                    self.network.update(self.pg.net, ctx, corr, None, self.pg.ii, self.pg.jj, self.pg.kk)
+                with TimerBlock("network update"):
+                    self.pg.net, (delta, weight, _) = \
+                        self.trt_update(self.pg.net, ctx, corr, None, self.pg.ii, self.pg.jj, self.pg.kk)
 
             lmbda = torch.as_tensor([1e-4], device="cuda")
             weight = weight.float()
@@ -347,74 +439,75 @@ class DPVO:
         self.pg.target = target
         self.pg.weight = weight
 
-        if self.use_metric_depth:
-            with Timer("BA", enabled=self.enable_timing):
-                try:
-                    # window start frame index (same as original dpvo logic)
-                    t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
-                    t0 = max(t0, 1)
-
-                    # bounds for in-bounds check (match pops.transform coordinate system)
-                    bounds = torch.as_tensor(
-                        [0.0, 0.0, self.wd / self.RES, self.ht / self.RES],
-                        device="cuda"
-                    )
-
-                    # select active factors inside the window, like fastba does via t0
-                    # (python BA doesn't have t0, so we filter edges ourselves)
-                    keep = (self.pg.ii >= t0) & (self.pg.jj >= t0)
-
-                    ii = self.pg.ii[keep]
-                    jj = self.pg.jj[keep]
-                    kk = self.pg.kk[keep]
-
-                    target = self.pg.target[:, keep]
-                    weight = self.pg.weight[:, keep]
-
-                    # prior disp + gate (flattened per patch)
-                    prior_disps = self.pg.prior_disps  # shape (1, N*M, 1)
-                    depth_gate = self.pg.depth_gate    # shape (1, N*M, 1)
-
-
-                    for _ in range(1):
-                        poses_new, patches_new = python_BA(
-                            SE3(self.poses),                    # poses object
-                            self.patches,                       # (1, N*M, 3, P, P)
-                            self.intrinsics,                    # (1, N, 4)
-                            target, weight,
-                            torch.as_tensor([1e-4], device="cuda"),
-                            ii, jj, kk,
-                            bounds=bounds,
-                            fixedp=1,
-                            prior_disps=prior_disps,
-                            depth_gate=depth_gate,
-                            prior_weight=0 if not self.use_metric_depth else (self.cfg.DEPTH_PRIOR_W if hasattr(self.cfg, "DEPTH_PRIOR_W") else 5)
-                        )
-                        self.pg.poses_.copy_(poses_new.data.reshape_as(self.pg.poses_))
-                        self.pg.patches_.copy_(patches_new.reshape_as(self.pg.patches_))
-                except Exception as e:
-                    print("Warning python BA failed:", e)
-
-                points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
-                points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
-                self.pg.points_[:len(points)] = points[:]
-        else:
-            with Timer("BA", enabled=self.enable_timing):
-                try:
-                    # run global bundle adjustment if there exist long-range edges
-                    if (self.pg.ii < self.n - self.cfg.REMOVAL_WINDOW - 1).any() and not self.ran_global_ba[self.n]:
-                        self.__run_global_BA()
-                    else:
+        with TimerBlock("BA"):
+            if self.use_metric_depth:
+                with Timer("BA", enabled=self.enable_timing):
+                    try:
+                        # window start frame index (same as original dpvo logic)
                         t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
                         t0 = max(t0, 1)
-                        fastba.BA(self.poses, self.patches, self.intrinsics, 
-                            target, weight, lmbda, self.pg.ii, self.pg.jj, self.pg.kk, t0, self.n, M=self.M, iterations=2, eff_impl=False)
-                except:
-                    print("Warning BA failed...")
 
-                points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
-                points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
-                self.pg.points_[:len(points)] = points[:]
+                        # bounds for in-bounds check (match pops.transform coordinate system)
+                        bounds = torch.as_tensor(
+                            [0.0, 0.0, self.wd / self.RES, self.ht / self.RES],
+                            device="cuda"
+                        )
+
+                        # select active factors inside the window, like fastba does via t0
+                        # (python BA doesn't have t0, so we filter edges ourselves)
+                        keep = (self.pg.ii >= t0) & (self.pg.jj >= t0)
+
+                        ii = self.pg.ii[keep]
+                        jj = self.pg.jj[keep]
+                        kk = self.pg.kk[keep]
+
+                        target = self.pg.target[:, keep]
+                        weight = self.pg.weight[:, keep]
+
+                        # prior disp + gate (flattened per patch)
+                        prior_disps = self.pg.prior_disps  # shape (1, N*M, 1)
+                        depth_gate = self.pg.depth_gate    # shape (1, N*M, 1)
+
+
+                        for _ in range(1):
+                            poses_new, patches_new = python_BA(
+                                SE3(self.poses),                    # poses object
+                                self.patches,                       # (1, N*M, 3, P, P)
+                                self.intrinsics,                    # (1, N, 4)
+                                target, weight,
+                                torch.as_tensor([1e-4], device="cuda"),
+                                ii, jj, kk,
+                                bounds=bounds,
+                                fixedp=1,
+                                prior_disps=prior_disps,
+                                depth_gate=depth_gate,
+                                prior_weight=0 if not self.use_metric_depth else (self.cfg.DEPTH_PRIOR_W if hasattr(self.cfg, "DEPTH_PRIOR_W") else 5)
+                            )
+                            self.pg.poses_.copy_(poses_new.data.reshape_as(self.pg.poses_))
+                            self.pg.patches_.copy_(patches_new.reshape_as(self.pg.patches_))
+                    except Exception as e:
+                        print("Warning python BA failed:", e)
+
+                    points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
+                    points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
+                    self.pg.points_[:len(points)] = points[:]
+            else:
+                with Timer("BA", enabled=self.enable_timing):
+                    try:
+                        # run global bundle adjustment if there exist long-range edges
+                        if (self.pg.ii < self.n - self.cfg.REMOVAL_WINDOW - 1).any() and not self.ran_global_ba[self.n]:
+                            self.__run_global_BA()
+                        else:
+                            t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
+                            t0 = max(t0, 1)
+                            fastba.BA(self.poses, self.patches, self.intrinsics, 
+                                target, weight, lmbda, self.pg.ii, self.pg.jj, self.pg.kk, t0, self.n, M=self.M, iterations=2, eff_impl=False)
+                    except:
+                        print("Warning BA failed...")
+
+                    points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
+                    points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
+                    self.pg.points_[:len(points)] = points[:]
 
     def __edges_forw(self):
         r=self.cfg.PATCH_LIFETIME
@@ -446,11 +539,12 @@ class DPVO:
         image = 2 * (image[None,None] / 255.0) - 0.5
         
         with autocast(enabled=self.cfg.MIXED_PRECISION):
-            fmap, gmap, imap, patches, _, clr = \
-                self.network.patchify(image,
-                    patches_per_image=self.cfg.PATCHES_PER_FRAME, 
-                    centroid_sel_strat=self.cfg.CENTROID_SEL_STRAT, 
-                    return_color=True)
+            with TimerBlock("patchify"):
+                fmap, gmap, imap, patches, _, clr = \
+                    self.patchify_trt(image,
+                        patches_per_image=self.cfg.PATCHES_PER_FRAME, 
+                        centroid_sel_strat=self.cfg.CENTROID_SEL_STRAT, 
+                        return_color=True)
 
         ### update state attributes ###
         self.tlist.append(tstamp)
