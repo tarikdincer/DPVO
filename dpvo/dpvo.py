@@ -388,8 +388,11 @@ class DPVO:
                             fixedp=1,
                             prior_disps=prior_disps,
                             depth_gate=depth_gate,
-                            prior_weight=0 if not self.use_metric_depth else (self.cfg.DEPTH_PRIOR_W if hasattr(self.cfg, "DEPTH_PRIOR_W") else 5)
+                            prior_weight=0 if not self.use_metric_depth else (self.cfg.DEPTH_PRIOR_W if hasattr(self.cfg, "DEPTH_PRIOR_W") else 0.1)
                         )
+                        # --- DEBUG: BA pose/structure update magnitude ---
+                        pose_delta = (poses_new.data - SE3(self.poses).data).norm(dim=-1).mean()
+                        patch_delta = (patches_new - self.patches).abs().mean()
                         self.pg.poses_.copy_(poses_new.data.reshape_as(self.pg.poses_))
                         self.pg.patches_.copy_(patches_new.reshape_as(self.pg.patches_))
                 except Exception as e:

@@ -84,8 +84,18 @@ def block_show(A):
     plt.show()
 
 def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, ep=100.0, PRINT=False, fixedp=1, structure_only=False,
-       prior_disps=None, depth_gate=None, prior_weight=0.05):
-    """ bundle adjustment """
+       prior_disps=None, depth_gate=None, prior_weight=0.1):
+    """Bundle adjustment with depth-adaptive relative prior.
+
+    Parameters
+    ----------
+    prior_weight : float
+        Fraction of C_reproj to use as prior strength.  E.g. 0.1 means the
+        prior contributes ~10% of the total Hessian diagonal for close objects,
+        scaling down naturally for far objects via the disp² factor.
+        Old behaviour used an additive constant (default was 5); the new
+        default of 0.1 is a *ratio*, not an absolute value.
+    """
 
     b = 1
     n = max(ii.max().item(), jj.max().item()) + 1
@@ -182,9 +192,28 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, 
             else:
                 raise ValueError(...)
 
-        # Apply prior
-        C = C + gate_k * prior_weight
-        w = w + gate_k * prior_weight * (prior_k - cur_disp)
+        # ── Depth-adaptive relative prior ─────────────────────────
+        #
+        # The prior weight for each patch is:
+        #   w_prior_k = prior_weight * max(C_reproj_k, C_floor) * disp_prior_k^2
+        #
+        # - Multiplying by C makes the prior a constant *fraction* of the
+        #   reprojection information, so it doesn't wash out as observations
+        #   accumulate.
+        # - Multiplying by disp² makes the prior stronger for close objects
+        #   (where metric depth is reliable) and weaker for far objects
+        #   (where metric depth is noisy).  This matches the natural scaling
+        #   of the reprojection Jacobian w.r.t. disparity (J_z ~ f*d).
+        # - C_floor prevents division-by-zero for patches with no
+        #   reprojection observations yet.
+
+        C_floor = 1.0  # minimum C to avoid zero prior on unobserved patches
+        C_clamped = torch.clamp(C, min=C_floor)
+        disp_sq = (prior_k ** 2).clamp(min=1e-6)
+        w_prior = prior_weight * C_clamped * disp_sq
+
+        C = C + gate_k * w_prior
+        w = w + gate_k * w_prior * (prior_k - cur_disp)
 
 
     if isinstance(lmbda, torch.Tensor):
